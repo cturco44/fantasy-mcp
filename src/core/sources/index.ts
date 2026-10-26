@@ -1,7 +1,8 @@
 import type { Cache } from "../cache.js";
-import type { Player } from "../sleeper.js";
+import type { League, Player } from "../sleeper.js";
 import { NameIndex } from "./ids.js";
 import { loadEspn, type EspnData } from "./espn.js";
+import { loadFantasyCalc, type FantasyCalcData } from "./fantasycalc.js";
 import { loadFantasyPros, type FpData } from "./fantasypros.js";
 import { loadUsage, type UsageData } from "./nflverse.js";
 
@@ -11,6 +12,7 @@ export interface ExternalData {
   fpWeek?: number;
   espn?: EspnData;
   usage?: UsageData;
+  trade?: FantasyCalcData;
   errors: Record<string, string>;
 }
 
@@ -43,13 +45,15 @@ export async function loadExternal(
   season: string,
   week: number,
   opponents: Map<string, string>,
+  league: League,
 ): Promise<ExternalData> {
   const errors: Record<string, string> = {};
   const names = new NameIndex(players);
-  const [fp, espn, usage] = await Promise.all([
+  const [fp, espn, usage, trade] = await Promise.all([
     attempt("fantasypros", errors, () => loadFantasyPros(cache, names)),
     attempt("espn", errors, () => loadEspn(cache, names, season, week)),
     attempt("nflverse", errors, () => loadUsage(cache, names, season)),
+    attempt("fantasycalc", errors, () => loadFantasyCalc(cache, league)),
   ]);
-  return { fp, fpWeek: fp ? detectWeek(fp, opponents, week) : undefined, espn, usage, errors };
+  return { fp, fpWeek: fp ? detectWeek(fp, opponents, week) : undefined, espn, usage, trade, errors };
 }

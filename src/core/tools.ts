@@ -6,6 +6,7 @@ import { Research, depthAhead, newsSummary } from "./research.js";
 import { SLOT_ELIGIBILITY, round1, scorePoints, startingSlots } from "./scoring.js";
 import type { Roster, SleeperClient } from "./sleeper.js";
 import { loadNews } from "./sources/news.js";
+import { evaluateTrade, positionalDepth } from "./trades.js";
 
 const WAIVER_TYPES: Record<number, string> = { 0: "rolling", 1: "reverse_standings", 2: "FAAB" };
 
@@ -14,7 +15,7 @@ function json(data: unknown) {
 }
 
 function asOf(ctx: LeagueContext) {
-  const { fp, fpWeek, espn, usage, errors } = ctx.ext;
+  const { fp, fpWeek, espn, usage, trade, errors } = ctx.ext;
   const ppr = ctx.league.scoring_settings.rec ?? 0;
   return {
     fetched_at: new Date().toISOString(),
@@ -28,6 +29,9 @@ function asOf(ctx: LeagueContext) {
       espn: espn ? "analyst ranks (avg of ESPN analysts, PPR positional), rostered %, outlooks" : "unavailable",
       usage: usage
         ? `nflverse play-by-play through week ${usage.through_week}${usage.through_week === ctx.week ? " (partial: only games final at its last nightly update)" : ""}; xfp/fp are PPR`
+        : "unavailable",
+      trade_values: trade
+        ? `FantasyCalc redraft trade values (from real trades), ${trade.params}; players not listed are below the trade-market floor`
         : "unavailable",
       stats: ctx.weekStarted
         ? `Sleeper box scores include week ${ctx.week} games that have kicked off (10-min refresh while live)`
@@ -88,41 +92,20 @@ async function onWaivers(sleeper: SleeperClient, ctx: LeagueContext): Promise<Se
   return out;
 }
 
-/** Starter demand vs supply per position: the core input for "do I need this position?" */
-function positionalDepth(analyzer: Analyzer, ctx: LeagueContext, roster: Roster) {
-  const slots = startingSlots(ctx.league.roster_positions);
-  const reserve = new Set(roster.reserve ?? []);
-  const rows = (roster.players ?? []).filter((id) => !reserve.has(id)).map((id) => analyzer.row(ctx, id));
-  const nextWeeks = [0, 1, 2, 3].map((d) => ctx.week + d).filter((w) => w <= ctx.lastWeek);
-
-  return Object.fromEntries(
-    ctx.positions.map((pos) => {
-      const players = rows.filter((r) => ctx.players[r.id]?.fantasy_positions.includes(pos)).sort((a, b) => b.ros - a.ros);
-      const dedicated = slots.filter((s) => s === pos).length;
-      const flex = slots.filter((s) => s !== pos && SLOT_ELIGIBILITY[s]?.includes(pos)).length;
-      const byeShortfalls = nextWeeks
-        .map((w) => ({ week: w, available: players.filter((p) => p.bye !== w && p.injury !== "Out" && p.injury !== "IR").length }))
-        .filter((x) => x.available < dedicated);
-      return [
-        pos,
-        {
-          dedicated_slots: dedicated,
-          flex_slots_eligible: flex,
-          rostered: players.length,
-          players: players.map(
-            (p) =>
-              `${p.name} (ros ${p.ros}${p.fp_ros ? `, FP ROS ${p.fp_ros.rank}` : ""}, bye ${p.bye ?? "-"}${p.injury ? `, ${p.injury}` : ""})`,
-          ),
-          shortfall_weeks: byeShortfalls,
-        },
-      ];
-    }),
-  );
-}
-
 function slimRow<T extends PlayerRow>(r: T): T {
   // Drop empty fields; tool output size matters for chat context.
   return Object.fromEntries(Object.entries(r).filter(([, v]) => v != null && v !== "")) as T;
+}
+
+/** Resolve a player name, preferring a match on one of the given rosters. */
+function resolvePlayer(analyzer: Analyzer, ctx: LeagueContext, query: string, preferRosterIds: number[]): string {
+  const matches = analyzer.findPlayers(ctx, query);
+  const hit = matches.find((m) => preferRosterIds.includes(ctx.rosteredBy.get(m.id) ?? -1));
+  if (!hit) {
+    const owners = matches.map((m) => `${m.name} (${ctx.rosteredBy.has(m.id) ? "on another team" : "not rostered"})`);
+    throw new Error(`"${query}" isn't on the expected roster${owners.length ? `; closest: ${owners.join(", ")}` : ""}`);
+  }
+  return hit.id;
 }
 
 export function registerTools(server: McpServer, sleeper: SleeperClient, cache: Cache) {
@@ -581,6 +564,82 @@ export function registerTools(server: McpServer, sleeper: SleeperClient, cache: 
         };
       });
       return json({ type, hours, fetched_at: new Date().toISOString(), research_needed: research.result(), players: rows });
+    },
+  );
+
+  server.registerTool(
+    "evaluate_trade",
+    {
+      title: "Evaluate a trade",
+      description:
+        "Evaluate a proposed trade for both teams. Computes each side's change in projected optimal-lineup points for the rest of the season and the fantasy playoffs (bye overlaps and positional need included, bench players add ~0 unless they'd start), FantasyCalc market value in/out, roster-limit forced drops or the open bench spot, and new positional holes. Returns inputs, not a verdict. Judge by lineup points for this roster first, market value second, and check the partner's side: trades that only help you rarely get accepted.",
+      inputSchema: {
+        league_id: z.string(),
+        username: z.string().describe("Sleeper username of the team owner"),
+        give: z.array(z.string()).min(1).describe("Player names you send"),
+        get: z.array(z.string()).min(1).describe("Player names you receive"),
+        partner: z.string().optional().describe("Partner team name or owner username; inferred from who owns the `get` players if omitted"),
+      },
+    },
+    async ({ league_id, username, give, get, partner }) => {
+      const ctx = await analyzer.context(league_id);
+      const mine = await analyzer.findRoster(ctx, username);
+      const others = ctx.rosters.filter((r) => r.roster_id !== mine.roster_id);
+
+      let theirs: Roster | undefined;
+      if (partner) {
+        const q = partner.toLowerCase();
+        theirs = others.find((r) => {
+          const u = r.owner_id ? ctx.users.get(r.owner_id) : undefined;
+          return [teamName(r, ctx.users), u?.display_name].some((n) => n?.toLowerCase() === q);
+        });
+        if (!theirs) return json({ error: `No other team matches "${partner}"`, teams: others.map((r) => teamName(r, ctx.users)) });
+      }
+
+      try {
+        const giveIds = give.map((q) => resolvePlayer(analyzer, ctx, q, [mine.roster_id]));
+        const getIds = get.map((q) => resolvePlayer(analyzer, ctx, q, (theirs ? [theirs] : others).map((r) => r.roster_id)));
+        const owners = new Set(getIds.map((id) => ctx.rosteredBy.get(id)));
+        if (owners.size > 1) return json({ error: "The players you want to get are on different teams; a trade has one partner" });
+        theirs ??= others.find((r) => r.roster_id === [...owners][0])!;
+
+        const { me, them } = evaluateTrade(
+          analyzer,
+          ctx,
+          { name: teamName(mine, ctx.users), roster: mine },
+          { name: teamName(theirs, ctx.users), roster: theirs },
+          giveIds,
+          getIds,
+        );
+
+        const deadline = ctx.league.settings.trade_deadline;
+        const passed = deadline > 0 && ctx.week > deadline;
+        const winner = (mineVal: number | null, theirVal: number | null) =>
+          mineVal == null || theirVal == null || Math.abs(mineVal - theirVal) < 0.05 ? "even" : mineVal > theirVal ? "me" : "them";
+        const players = [...giveIds, ...getIds].map((id) => slimRow(analyzer.row(ctx, id)));
+
+        const research = new Research(ctx);
+        research.staleRankings();
+        for (const r of players) research.injury(r as PlayerRow);
+
+        return json({
+          data_as_of: asOf(ctx),
+          trade_deadline_week: deadline || null,
+          trade_deadline_passed: passed,
+          me,
+          them,
+          players: { give: players.slice(0, giveIds.length), get: players.slice(giveIds.length) },
+          research_needed: research.result(),
+          verdict_inputs: {
+            market_value_winner: me.market_delta == null ? "unknown (FantasyCalc unavailable)" : winner(me.market_delta, -me.market_delta),
+            ros_lineup_winner: winner(me.lineup_delta_ros, them.lineup_delta_ros),
+            playoff_lineup_winner: winner(me.lineup_delta_playoffs, them.lineup_delta_playoffs),
+            both_sides_gain_lineup_points: me.lineup_delta_ros > 0 && them.lineup_delta_ros > 0,
+          },
+        });
+      } catch (err) {
+        return json({ error: err instanceof Error ? err.message : String(err) });
+      }
     },
   );
 }

@@ -3,6 +3,7 @@ import { optimalLineup, leaguePositions, round1, scorePoints, startingSlots } fr
 import type { League, LeagueUser, Player, Projection, Roster, ScheduleGame, SleeperClient, Stats } from "./sleeper.js";
 import { loadExternal, type ExternalData } from "./sources/index.js";
 import type { FpRank } from "./sources/fantasypros.js";
+import type { TradeValue } from "./sources/fantasycalc.js";
 import { summarizeUsage, type UsageSummary } from "./sources/nflverse.js";
 
 export interface PlayerRow {
@@ -36,6 +37,8 @@ export interface PlayerRow {
     started_pct?: number;
   };
   usage?: { season?: UsageSummary; last3?: UsageSummary };
+  /** FantasyCalc market value; absent = below the trade-market floor (treat as 0). */
+  trade_value?: TradeValue;
 }
 
 /** Everything about one league needed to answer roster questions, fetched once per call. */
@@ -153,7 +156,7 @@ export class Analyzer {
     ]);
 
     const { byes, opponents, gameStatus } = scheduleMaps(schedule);
-    const ext = await loadExternal(this.cache, players, season, week, opponents);
+    const ext = await loadExternal(this.cache, players, season, week, opponents, league);
     const rosteredBy = new Map<string, number>();
     for (const r of rosters) for (const id of rosterPlayerIds(r)) rosteredBy.set(id, r.roster_id);
 
@@ -246,9 +249,9 @@ export class Analyzer {
   }
 
   /** FantasyPros / ESPN / usage fields for a player; omitted when a source has nothing. */
-  external(ctx: LeagueContext, id: string): Pick<PlayerRow, "fp_week" | "fp_ros" | "espn" | "usage"> {
-    const { fp, fpWeek, espn, usage } = ctx.ext;
-    const out: Pick<PlayerRow, "fp_week" | "fp_ros" | "espn" | "usage"> = {};
+  external(ctx: LeagueContext, id: string): Pick<PlayerRow, "fp_week" | "fp_ros" | "espn" | "usage" | "trade_value"> {
+    const { fp, fpWeek, espn, usage, trade } = ctx.ext;
+    const out: Pick<PlayerRow, "fp_week" | "fp_ros" | "espn" | "usage" | "trade_value"> = {};
 
     const w = fp?.weekly[id];
     if (w) out.fp_week = { week: fpWeek, rank: w.rank, ecr: w.ecr, sd: w.sd, best: w.best, worst: w.worst, grade: w.grade };
@@ -263,6 +266,8 @@ export class Analyzer {
 
     const games = usage?.games[id];
     if (games?.length) out.usage = { season: summarizeUsage(games), last3: summarizeUsage(games.slice(-3)) };
+    const { trade_frequency: _f, ...tv } = trade?.players[id] ?? ({} as TradeValue);
+    if (trade?.players[id]) out.trade_value = tv as TradeValue;
     return out;
   }
 
