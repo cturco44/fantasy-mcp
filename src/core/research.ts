@@ -154,6 +154,53 @@ export class Research {
     }
   }
 
+  /** Anyone in a trade who is Questionable or worse: the injury timeline decides the value. */
+  tradeInjury(row: PlayerRow) {
+    if (row.injury && QUESTIONABLE.has(row.injury)) {
+      this.add(
+        `tinj:${row.id}`,
+        `${row.name} is ${row.injury} and is part of this trade. Search ${searchHint(row)} injury timeline (diagnosis, expected return, practice reports) before judging his value; trade values and projections may not price it in.`,
+      );
+    }
+  }
+
+  /** Market value moving fast over 30 days. */
+  valueTrend(row: PlayerRow) {
+    const t = row.trade_value;
+    if (t && t.value >= 500 && Math.abs(t.trend_30d) > 0.1 * t.value) {
+      this.add(
+        `vtrend:${row.id}`,
+        `Market is moving on ${row.name}: trade value ${t.trend_30d > 0 ? "up" : "down"} ${Math.abs(t.trend_30d)} over 30 days (now ${t.value}, ${(100 * Math.abs(t.trend_30d) / t.value).toFixed(0)}% of value). Search ${searchHint(row)} for why (role, injury, schedule); if nothing explains it, say the cause is unknown.`,
+      );
+    }
+  }
+
+  /** FantasyCalc positional rank and FantasyPros ROS positional rank far apart. */
+  marketVsProjection(row: PlayerRow) {
+    const t = row.trade_value;
+    const fpRank = Number(row.fp_ros?.rank?.match(/\d+/)?.[0]);
+    if (!t || !fpRank) return;
+    const gap = Math.abs(t.pos_rank - fpRank);
+    if (gap >= Math.max(6, 0.5 * Math.min(t.pos_rank, fpRank))) {
+      this.add(
+        `mvp:${row.id}`,
+        `Market and experts disagree on ${row.name}: FantasyCalc ${row.pos}${t.pos_rank} vs FantasyPros ROS ${row.fp_ros!.rank}. ${t.pos_rank < fpRank ? "The market values him more than experts do" : "Experts like him more than the market"}; search ${searchHint(row)} recent analysis to see which is right.`,
+      );
+    }
+  }
+
+  /** Trade deadline passed or close. */
+  deadline() {
+    const week = this.ctx?.week;
+    const deadline = this.ctx?.league.settings.trade_deadline;
+    if (!week || !deadline || deadline <= 0) return;
+    if (week > deadline) {
+      this.add("deadline", `The trade deadline (week ${deadline}) has passed; trades can't be processed now.`);
+    } else if (deadline - week <= 1) {
+      this.add("deadline", `The trade deadline is week ${deadline} (this is week ${week}): propose now, since a counteroffer round may not fit.`);
+    }
+  }
+
   staleRankings() {
     if (!this.ctx) return;
     const { fpWeek } = this.ctx.ext;

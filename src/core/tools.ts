@@ -6,7 +6,7 @@ import { Research, depthAhead, newsSummary } from "./research.js";
 import { SLOT_ELIGIBILITY, round1, scorePoints, startingSlots } from "./scoring.js";
 import type { Roster, SleeperClient } from "./sleeper.js";
 import { loadNews } from "./sources/news.js";
-import { evaluateTrade, positionalDepth } from "./trades.js";
+import { evaluateTrade, findTradePartners, positionalDepth } from "./trades.js";
 
 const WAIVER_TYPES: Record<number, string> = { 0: "rolling", 1: "reverse_standings", 2: "FAAB" };
 
@@ -620,7 +620,12 @@ export function registerTools(server: McpServer, sleeper: SleeperClient, cache: 
 
         const research = new Research(ctx);
         research.staleRankings();
-        for (const r of players) research.injury(r as PlayerRow);
+        research.deadline();
+        for (const r of players) {
+          research.tradeInjury(r as PlayerRow);
+          research.valueTrend(r as PlayerRow);
+          research.marketVsProjection(r as PlayerRow);
+        }
 
         return json({
           data_as_of: asOf(ctx),
@@ -640,6 +645,92 @@ export function registerTools(server: McpServer, sleeper: SleeperClient, cache: 
       } catch (err) {
         return json({ error: err instanceof Error ? err.message : String(err) });
       }
+    },
+  );
+
+  server.registerTool(
+    "find_trade_partners",
+    {
+      title: "Find trade partners",
+      description:
+        "Search every other team for win-win trades: 1-for-1, 2-for-1 and 1-for-2 swaps where BOTH teams' projected rest-of-season lineup points go up and FantasyCalc market values are within ~20% (so the other side is likely to accept). Ranked by the smaller of the two teams' gains, then your playoff gain, with a note on why it works for them. Verify any idea with evaluate_trade and research the players before proposing.",
+      inputSchema: {
+        league_id: z.string(),
+        username: z.string().describe("Sleeper username of the team owner"),
+        target_position: z.string().optional().describe("Only trades that bring back a player at this position (e.g. TE)"),
+        offer_position: z.string().optional().describe("Only trades that send out a player at this position"),
+        max_results: z.number().int().min(1).max(10).default(5),
+      },
+    },
+    async ({ league_id, username, target_position, offer_position, max_results }) => {
+      const ctx = await analyzer.context(league_id);
+      const mine = await analyzer.findRoster(ctx, username);
+      const deadline = ctx.league.settings.trade_deadline;
+      const result = findTradePartners(analyzer, ctx, mine, (r) => teamName(r, ctx.users), {
+        targetPosition: target_position?.toUpperCase(),
+        offerPosition: offer_position?.toUpperCase(),
+        maxResults: max_results,
+      });
+      const research = new Research(ctx);
+      research.staleRankings();
+      research.deadline();
+      return json({
+        data_as_of: asOf(ctx),
+        trade_deadline_week: deadline || null,
+        trade_deadline_passed: deadline > 0 && ctx.week > deadline,
+        ...result,
+        research_needed: research.result(),
+      });
+    },
+  );
+
+  server.registerTool(
+    "get_trade_values",
+    {
+      title: "Get trade values",
+      description:
+        "What players are worth on the trade market (FantasyCalc value, rank, 30-day trend), next to FantasyPros rest-of-season rank and this league's ROS projection, plus who rosters them. Pass player names, or a position to see the top of the market. Market value is only one input: it can disagree with ROS rank and projection, and that gap is worth researching.",
+      inputSchema: {
+        league_id: z.string(),
+        players: z.array(z.string()).max(15).optional().describe("Player names"),
+        position: z.string().optional().describe("Position (QB/RB/WR/TE) to list the top of the market"),
+        limit: z.number().int().min(1).max(30).default(15).describe("Rows when listing by position"),
+      },
+    },
+    async ({ league_id, players, position, limit }) => {
+      const ctx = await analyzer.context(league_id);
+      const trade = ctx.ext.trade;
+      if (!trade) return json({ error: "FantasyCalc trade values are unavailable right now", data_as_of: asOf(ctx) });
+      if (!players?.length && !position) return json({ error: "Pass players or position" });
+
+      const ids = players?.length
+        ? players.map((q) => analyzer.findPlayers(ctx, q)[0]?.id ?? q)
+        : Object.entries(trade.players)
+            .filter(([id]) => ctx.players[id]?.fantasy_positions.includes(position!.toUpperCase()))
+            .sort((a, b) => a[1].rank - b[1].rank)
+            .slice(0, limit)
+            .map(([id]) => id);
+
+      const research = new Research(ctx);
+      const rows = ids.map((id) => {
+        const row = analyzer.row(ctx, id);
+        const owner = ctx.rosteredBy.get(id);
+        const ownerRoster = owner != null ? ctx.rosters.find((r) => r.roster_id === owner) : undefined;
+        research.valueTrend(row);
+        research.marketVsProjection(row);
+        return {
+          name: row.name,
+          pos: row.pos,
+          team: row.team,
+          injury: row.injury ?? undefined,
+          trade_value: row.trade_value ?? "below trade-market floor (treat as 0)",
+          fp_ros: row.fp_ros,
+          ros: row.ros,
+          playoffs: row.playoffs,
+          rostered_by: ownerRoster ? teamName(ownerRoster, ctx.users) : "available",
+        };
+      });
+      return json({ data_as_of: asOf(ctx), research_needed: research.result(), players: rows });
     },
   );
 }

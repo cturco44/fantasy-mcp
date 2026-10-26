@@ -24,6 +24,8 @@ Ask Claude questions like you'd ask a friend who follows fantasy closely:
 | 📈 *"Why is everyone adding this guy?"* | Checks the depth chart (is the starter ahead of him hurt?), recent news, and usage trends. If nothing explains the spike, it searches the web, and if it still can't find a reason it says so instead of guessing. |
 | 🏥 *"What's the latest on my injured WR?"* | Pulls timestamped news, then searches for practice reports and beat-reporter updates newer than the official designation. |
 | 🤔 *"Is the top-ranked TE actually better for my team?"* | Puts FantasyPros, ESPN analysts, projections and usage side by side and explains the tie-breaker for your roster. |
+| 🤝 *"Is this trade fair: my X for their Y?"* | Computes each team's change in projected starting-lineup points for the rest of the season and your fantasy playoffs (bye overlaps and positional need included), FantasyCalc market value, roster-limit drops, and whether the other team would actually benefit, then researches every player in the deal. |
+| 🔎 *"Find me a trade for a TE."* | Searches every other team for win-win swaps where both lineups improve and market values are within ~20%, with a note on why each works for them. |
 | 🗺️ *"Which teams in my league need a RB?"* | Ranks every team's strength by position and shows waiver order and FAAB budgets, so you know who you're competing with for a pickup. |
 
 ### 🧠 Built around your roster, not just rankings
@@ -45,7 +47,7 @@ This is the main thing that sets it apart. Answering a question takes three laye
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ 1. 📊 DATA: the server merges 6 sources into each player          │
+│ 1. 📊 DATA: the server merges 7 sources into each player          │
 │    Sleeper league data · projections · FantasyPros consensus ·    │
 │    ESPN analysts · usage data · timestamped news                  │
 ├──────────────────────────────────────────────────────────────────┤
@@ -80,6 +82,10 @@ generated when it spots:
 | 📊 **Role change** | *"Possible role change: target share 23.6% last 3 games vs 16.5% season. Search depth chart/usage news."* |
 | ⚔️ **Experts disagree** | *"Experts split: FantasyPros K6 vs ESPN analysts avg K31. Search for what's driving the gap."* |
 | 🪙 **Close lineup call** | *"Close call at FLEX: Player A (11.5) vs Player B (10.3). Search matchup and news for both."* |
+| 🤝 **Trade injury** | *"Player is Questionable and part of this trade. Search his injury timeline before judging his value."* |
+| 💹 **Market moving** | *"Trade value down 1668 over 30 days. Search for why; if nothing explains it, say the cause is unknown."* |
+| 🆚 **Market vs experts** | *"FantasyCalc RB15 vs FantasyPros ROS RB30. Search recent analysis to see which is right."* |
+| 📅 **Trade deadline** | *"The trade deadline is week 11 (this is week 10): propose now."* |
 | ⏰ **Stale rankings** | *"FantasyPros weekly ranks are still for last week; weigh projections, rest-of-season ranks and news more."* |
 
 Claude is instructed to **run every flagged search**, web-search recent news for every player it
@@ -112,10 +118,14 @@ tells Claude where to dig:
 | `get_league_landscape` | Every team's strength by position, waiver order or FAAB, and recent transactions with bids |
 | `get_rankings` | FantasyPros consensus for a position next to ESPN ranks and league projections, with who rosters each player |
 | `get_trending_players` | Sleeper-wide trending adds/drops, with depth-chart context, latest news, and availability in your league |
+| `evaluate_trade` | A proposed trade from both sides: rest-of-season and playoff lineup-point change, FantasyCalc market value in/out, forced roster-limit drops or open bench spot, new positional holes, trade deadline, research flags |
+| `find_trade_partners` | Win-win 1-for-1, 2-for-1 and 1-for-2 swaps across the league (both lineups improve, market values within ~20%), ranked, with why each works for the other team |
+| `get_trade_values` | FantasyCalc value, rank and 30-day trend next to FantasyPros ROS rank and ROS projection, for named players or the top of a position |
 
-Two **prompts** run full workflows from Claude's prompt menu:
+Three **prompts** run full workflows from Claude's prompt menu:
 - `waiver_review`: the full waiver workflow, ending in ranked add/drop/bid recommendations
 - `start_sit`: best lineup this week, with research on the close calls
+- `trade_review`: evaluate a trade (or find one) and recommend accept, decline or counter
 
 All tools are **read-only**. It recommends; you make the moves in Sleeper.
 
@@ -223,6 +233,9 @@ Then, in each chat:
 - *"Who's the best TE available, and is he actually better than mine for my team?"*
 - *"Who should be in my flex spots this week?"*
 - *"Which teams in my league need a RB, and how does that affect who I target?"*
+- *"Is this trade fair: my Josh Jacobs for their Bucky Irving?"*
+- *"Find me a trade for a TE."*
+- *"What's Saquon worth on the trade market, and why has it dropped?"*
 - *"How current is the data you're using right now?"*
 
 ---
@@ -237,13 +250,15 @@ src/
     scoring.ts          league-specific scoring, roster slot eligibility, best-lineup logic
     research.ts         research_needed flags + depth-chart context
     tools.ts            MCP tool definitions
-    prompts.ts          waiver_review / start_sit workflows
+    trades.ts           rest-of-season lineup value, trade evaluation, trade partner search
+    prompts.ts          waiver_review / start_sit / trade_review workflows
     instructions.ts     how Claude should reason (sent to Claude on connect)
     sources/
       fantasypros.ts    FantasyPros consensus (via DynastyProcess)
       espn.ts           ESPN analyst ranks, rostered %, outlooks
       nflverse.ts       usage + expected fantasy points
       news.ts           ESPN player news
+      fantasycalc.ts    trade market values
       ids.ts            cross-site player ID matching
   storage/              cache backends (local files now; Cloudflare KV later)
   adapters/             entry points: stdio (Claude Desktop/Code), HTTP (node)
@@ -271,6 +286,7 @@ src/
 | [DynastyProcess](https://github.com/dynastyprocess/data) | FantasyPros consensus (weekly + rest-of-season), player ID crosswalk | 3 h (updated ~2× daily upstream) |
 | ESPN fantasy API | Analyst ranks, rostered %, weekly outlooks | 3 h |
 | ESPN player news | Timestamped news blurbs | 30 min |
+| [FantasyCalc](https://fantasycalc.com) | Redraft trade values from real trades (matched to your league's size, QBs and PPR) | 6 h |
 | [ffopportunity](https://github.com/ffverse/ffopportunity) / [nflverse](https://github.com/nflverse) | Expected vs. actual fantasy points, target/air-yard/rush share | 6 h (nightly upstream) |
 
 Cached responses live in `.cache/`. Delete it to force a full refresh.
@@ -294,7 +310,6 @@ Cached responses live in `.cache/`. Delete it to force a full refresh.
 ## 🗺️ Roadmap
 
 - ☁️ Deploy to Cloudflare Workers with Google login, so it works on your phone and stays private
-- 🤝 Trade analysis (FantasyCalc trade values plus league needs → trade partner suggestions)
 - 🎰 Vegas implied team totals for weekly start/sit
 
 ---

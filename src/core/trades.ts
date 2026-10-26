@@ -167,25 +167,14 @@ function depthSummary(analyzer: Analyzer, ctx: LeagueContext, roster: Roster) {
   );
 }
 
-function evaluateSide(
-  analyzer: Analyzer,
-  ctx: LeagueContext,
-  team: string,
-  roster: Roster,
-  out: string[],
-  incoming: string[],
-): TradeSide {
-  const name = (id: string) => ctx.players[id]?.name ?? id;
-  const outSet = new Set(out);
+/** Lineup value of a roster after a trade, dropping the least useful players if it exceeds the roster limit. */
+function applyTrade(ctx: LeagueContext, before: string[], afterIds: string[], incoming: string[]) {
   const limit = rosterLimit(ctx);
-  const before = activeIds(roster);
-  const beforeValue = rosLineupPoints(ctx, before);
-
-  let after = [...before.filter((id) => !outSet.has(id)), ...incoming];
+  const name = (id: string) => ctx.players[id]?.name ?? id;
+  let after = afterIds;
   let afterValue = rosLineupPoints(ctx, after);
-
   // Over the roster limit: drop the players who contribute least (fewest starts, then lowest market value, then ROS).
-  const forced: NonNullable<TradeSide["forced_drops"]> = [];
+  const forced: { name: string; ros: number; market_value: number | null }[] = [];
   const protectedIds = new Set(incoming);
   while (after.length > limit) {
     const victim = after
@@ -201,7 +190,29 @@ function evaluateSide(
     after = after.filter((id) => id !== victim);
     afterValue = rosLineupPoints(ctx, after);
   }
+  return { after, afterValue, forced };
+}
 
+function afterIdsOf(before: string[], out: string[], incoming: string[]): string[] {
+  const outSet = new Set(out);
+  return [...before.filter((id) => !outSet.has(id)), ...incoming];
+}
+
+function evaluateSide(
+  analyzer: Analyzer,
+  ctx: LeagueContext,
+  team: string,
+  roster: Roster,
+  out: string[],
+  incoming: string[],
+): TradeSide {
+  const name = (id: string) => ctx.players[id]?.name ?? id;
+  const outSet = new Set(out);
+  const limit = rosterLimit(ctx);
+  const before = activeIds(roster);
+  const beforeValue = rosLineupPoints(ctx, before);
+
+  const { after, afterValue, forced } = applyTrade(ctx, before, afterIdsOf(before, out, incoming), incoming);
   const sum = (ids: string[]) => (ctx.ext.trade ? ids.reduce((s, id) => s + (marketValue(ctx, id) ?? 0), 0) : null);
   const valueOut = sum(out);
   const valueIn = sum(incoming);
@@ -270,5 +281,170 @@ export function evaluateTrade(
   return {
     me: evaluateSide(analyzer, ctx, teamA.name, teamA.roster, give, get),
     them: evaluateSide(analyzer, ctx, teamB.name, teamB.roster, get, give),
+  };
+}
+
+export interface TradeIdea {
+  partner: string;
+  give: string[];
+  get: string[];
+  my_gain_ros: number;
+  my_gain_playoffs: number;
+  their_gain_ros: number;
+  their_gain_playoffs: number;
+  market_me_gives: number | null;
+  market_me_gets: number | null;
+  market_gap_pct: number | null;
+  notes: string[];
+  why_it_works_for_them: string;
+}
+
+const MAX_MARKET_GAP = 0.2;
+const SIDE_CAP = 10;
+
+/** Per-team starter strength at each position (sum of top-N ROS), to say who needs what. */
+function positionRanks(ctx: LeagueContext): Map<number, Record<string, { rank: number; of: number }>> {
+  const slots = startingSlots(ctx.league.roster_positions);
+  const strength = new Map<number, Record<string, number>>();
+  for (const r of ctx.rosters) {
+    const by: Record<string, number> = {};
+    for (const pos of ctx.positions) {
+      const n = Math.max(1, slots.filter((sl) => sl === pos).length);
+      by[pos] = activeIds(r)
+        .filter((id) => ctx.players[id]?.fantasy_positions.includes(pos))
+        .map((id) => rosOf(ctx, id))
+        .sort((a, b) => b - a)
+        .slice(0, n)
+        .reduce((sum, x) => sum + x, 0);
+    }
+    strength.set(r.roster_id, by);
+  }
+  const out = new Map<number, Record<string, { rank: number; of: number }>>();
+  for (const r of ctx.rosters) {
+    out.set(
+      r.roster_id,
+      Object.fromEntries(
+        ctx.positions.map((pos) => {
+          const mine = strength.get(r.roster_id)![pos];
+          const rank = 1 + ctx.rosters.filter((o) => strength.get(o.roster_id)![pos] > mine).length;
+          return [pos, { rank, of: ctx.rosters.length }];
+        }),
+      ),
+    );
+  }
+  return out;
+}
+
+function subsets(ids: string[], size: number): string[][] {
+  if (size === 1) return ids.map((id) => [id]);
+  const out: string[][] = [];
+  for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) out.push([ids[i], ids[j]]);
+  return out;
+}
+
+export interface FindOptions {
+  targetPosition?: string;
+  offerPosition?: string;
+  maxResults: number;
+}
+
+/** Win-win 1-for-1, 2-for-1 and 1-for-2 swaps with every other team that are close enough in market value to get accepted. */
+export function findTradePartners(analyzer: Analyzer, ctx: LeagueContext, mine: Roster, teamName: (r: Roster) => string, opts: FindOptions) {
+  const skipPos = new Set(["K", "DEF"].filter((p) => p !== opts.targetPosition && p !== opts.offerPosition));
+  const fa = bestFreeAgent(analyzer, ctx);
+  const limit = rosterLimit(ctx);
+  const hasMarket = !!ctx.ext.trade;
+  const ranks = positionRanks(ctx);
+
+  // Normalise ROS and market value so one cap ranks both.
+  const rostered = ctx.rosters.flatMap(activeIds);
+  const maxRos = Math.max(1, ...rostered.map((id) => rosOf(ctx, id)));
+  const maxVal = Math.max(1, ...rostered.map((id) => marketValue(ctx, id) ?? 0));
+  const weight = (id: string) => Math.max(rosOf(ctx, id) / maxRos, (marketValue(ctx, id) ?? 0) / maxVal);
+  const tradeable = (r: Roster) =>
+    activeIds(r)
+      .filter((id) => ctx.players[id]?.fantasy_positions.some((p) => !skipPos.has(p)))
+      .sort((a, b) => weight(b) - weight(a))
+      .slice(0, SIDE_CAP);
+  const hasPos = (ids: string[], pos?: string) => !pos || ids.some((id) => ctx.players[id]?.fantasy_positions.includes(pos));
+
+  const myActive = activeIds(mine);
+  const myBase = rosLineupPoints(ctx, myActive);
+  const myPool = tradeable(mine);
+  const ideas: (TradeIdea & { _score: number })[] = [];
+
+  for (const other of ctx.rosters) {
+    if (other.roster_id === mine.roster_id) continue;
+    const theirActive = activeIds(other);
+    const theirBase = rosLineupPoints(ctx, theirActive);
+    const theirPool = tradeable(other);
+    const sizes: [number, number][] = [[1, 1], [2, 1], [1, 2]];
+
+    const side = (base: string[], baseValue: LineupValue, out: string[], incoming: string[]) => {
+      const { after, afterValue, forced } = applyTrade(ctx, base, afterIdsOf(base, out, incoming), incoming);
+      let ros = afterValue.ros;
+      // A consolidation frees a spot worth the best free agent.
+      if (fa && after.length < base.length && after.length < limit) ros = rosLineupPoints(ctx, [...after, fa.id]).ros;
+      return { ros: ros - baseValue.ros, playoffs: afterValue.playoffs - baseValue.playoffs, forced };
+    };
+
+    for (const [g, r] of sizes) {
+      for (const give of subsets(myPool, g)) {
+        if (!hasPos(give, opts.offerPosition)) continue;
+        const valueOut = give.reduce((s, id) => s + (marketValue(ctx, id) ?? 0), 0);
+        for (const get of subsets(theirPool, r)) {
+          if (!hasPos(get, opts.targetPosition)) continue;
+          const valueIn = get.reduce((s, id) => s + (marketValue(ctx, id) ?? 0), 0);
+          const gap = Math.abs(valueOut - valueIn) / Math.max(valueOut, valueIn, 1);
+          if (hasMarket && gap > MAX_MARKET_GAP) continue;
+
+          const mineSide = side(myActive, myBase, give, get);
+          if (mineSide.ros <= 0) continue;
+          const theirSide = side(theirActive, theirBase, get, give);
+          if (theirSide.ros <= 0) continue;
+
+          const notes = [
+            ...mineSide.forced.map((d) => `you'd drop ${d.name}`),
+            ...theirSide.forced.map((d) => `they'd drop ${d.name}`),
+          ];
+          const posOf = (id: string) => ctx.players[id]?.position ?? "?";
+          const theirIncoming = [...new Set(give.map(posOf))].filter((p) => ranks.get(other.roster_id)?.[p]);
+          const theirOutgoing = [...new Set(get.map(posOf))].filter((p) => ranks.get(other.roster_id)?.[p]);
+          const rk = ranks.get(other.roster_id)!;
+          const why = [
+            ...theirIncoming.map((p) => `adds ${p} (they rank ${rk[p].rank}/${rk[p].of} at ${p})`),
+            ...theirOutgoing.map((p) => `gives from ${p} (they rank ${rk[p].rank}/${rk[p].of})`),
+          ].join("; ");
+
+          ideas.push({
+            partner: teamName(other),
+            give: give.map((id) => ctx.players[id].name),
+            get: get.map((id) => ctx.players[id].name),
+            my_gain_ros: round1(mineSide.ros),
+            my_gain_playoffs: round1(mineSide.playoffs),
+            their_gain_ros: round1(theirSide.ros),
+            their_gain_playoffs: round1(theirSide.playoffs),
+            market_me_gives: hasMarket ? valueOut : null,
+            market_me_gets: hasMarket ? valueIn : null,
+            market_gap_pct: hasMarket ? Math.round(gap * 100) : null,
+            notes,
+            why_it_works_for_them: `+${round1(theirSide.ros)} ROS lineup pts: ${why}`,
+            _score: Math.min(mineSide.ros, theirSide.ros),
+          });
+        }
+      }
+    }
+  }
+
+  ideas.sort((a, b) => b._score - a._score || b.my_gain_playoffs - a.my_gain_playoffs);
+  // At most 2 ideas per partner so the list isn't one team's variations.
+  const perPartner = new Map<string, number>();
+  const top = ideas.filter((i) => {
+    const n = perPartner.get(i.partner) ?? 0;
+    perPartner.set(i.partner, n + 1);
+    return n < 2;
+  });
+  return { evaluated_ideas: ideas.length, ideas: top.slice(0, opts.maxResults).map(({ _score, ...i }) => i), market_filter: hasMarket,
+    ...(hasMarket ? {} : { warning: "FantasyCalc is unavailable, so these swaps are NOT checked for market fairness and may be lopsided; the other team is unlikely to accept many of them." }),
   };
 }
