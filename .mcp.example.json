@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "fantasy": {
+      "type": "stdio",
+      "command": "/absolute/path/to/node",
+      "args": [
+        "/absolute/path/to/fantasy-mcp/node_modules/tsx/dist/cli.mjs",
+        "/absolute/path/to/fantasy-mcp/src/adapters/stdio.ts"
+      ]
+    }
+  }
+}

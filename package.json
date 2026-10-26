@@ -1,0 +1,28 @@
+{
+  "name": "fantasy-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Roster-aware fantasy football MCP server for Sleeper leagues",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/adapters/node-http.ts",
+    "start": "tsx src/adapters/node-http.ts",
+    "stdio": "tsx src/adapters/stdio.ts",
+    "typecheck": "tsc --noEmit",
+    "inspect": "npx @modelcontextprotocol/inspector"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "hono": "^4.13.14",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
