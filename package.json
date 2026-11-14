@@ -14,13 +14,15 @@
     "typecheck": "tsc --noEmit",
     "inspect": "npx @modelcontextprotocol/inspector",
     "build": "tsc -p tsconfig.build.json",
-    "deploy": "gcloud run deploy fantasy-mcp --source . --region us-central1 --project fantasy-mcp --allow-unauthenticated --min-instances 0 --max-instances 1 --concurrency 20 --timeout 60 --memory 512Mi --cpu 1 --cpu-throttling --quiet"
+    "deploy": "gcloud run deploy fantasy-mcp --source . --region us-central1 --project fantasy-mcp --allow-unauthenticated --min-instances 0 --max-instances 1 --concurrency 20 --timeout 60 --memory 512Mi --cpu 1 --cpu-throttling --quiet",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@google-cloud/storage": "^9.0.0",
     "@hono/node-server": "^2.1.5",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "hono": "^4.13.14",
+    "jose": "^6.2.17",
     "zod": "^4.6.7"
   },
   "devDependencies": {
