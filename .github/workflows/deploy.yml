@@ -1,0 +1,68 @@
+name: Deploy
+
+# Only pushes to main (and manual runs). NEVER pull_request: this repo is public, and fork PRs must not
+# be able to deploy or reach Google credentials. The Google side also enforces this: the workload
+# identity provider only accepts tokens from cturco44/fantasy-mcp on refs/heads/main.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # workload identity federation (no JSON key anywhere)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      # Env vars and secrets (JWT_SECRET, Google client, allowlist, ...) live on the service and persist
+      # across deploys, so none are passed here. Only the cost caps are repeated so they can't be dropped.
+      - id: deploy
+        uses: google-github-actions/deploy-cloudrun@2028e2d7d30a78c6910e0632e48dd561b064884d # v3
+        with:
+          service: fantasy-mcp
+          region: us-central1
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          source: .
+          flags: >-
+            --min-instances=0 --max-instances=1 --concurrency=20 --timeout=60
+            --memory=512Mi --cpu=1 --cpu-throttling
+
+      - name: Smoke test
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          echo "Testing $URL"
+          root=$(curl -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 5 --retry-all-errors "$URL/")
+          mcp=$(curl -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 5 --retry-all-errors -X POST \
+            -H 'content-type: application/json' -d '{}' "$URL/mcp")
+          echo "GET / -> $root (expect 200); POST /mcp -> $mcp (expect 401)"
+          [ "$root" = "200" ] && [ "$mcp" = "401" ]
