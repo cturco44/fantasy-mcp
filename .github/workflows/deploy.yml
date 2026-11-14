@@ -6,6 +6,8 @@ name: Deploy
 on:
   push:
     branches: [main]
+    # Docs-only pushes don't need a rebuild. (Edits to this workflow file still run it.)
+    paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
 
 concurrency:

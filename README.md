@@ -144,7 +144,11 @@ cd fantasy-mcp
 npm install
 ```
 
-### 2. Connect it to Claude
+### 2. Run it locally (Claude Desktop / Claude Code)
+
+Skip this if you only want the hosted version (see *Deploying to Cloud Run* below).
+> 💡 If you use **both** a local and a hosted server, name the local entry `fantasy-local` (instead of
+> `fantasy` below) so the two don't clash, and keep the hosted connector named `fantasy`.
 
 #### 🖥️ Claude Desktop
 
@@ -188,38 +192,151 @@ npm run dev       # HTTP server at http://localhost:8787/mcp
 npm run inspect   # MCP Inspector UI: call tools by hand and see raw output
 ```
 
-### 3. 🎯 Set up a Claude Project (recommended)
+### 3. 🎯 Set up a Claude Project (strongly recommended)
 
 A Claude Project gives every chat the same standing instructions, so you don't repeat your username
 or the research rules each time. Your own instructions also carry more weight with Claude than a
-server's, which is what makes the research reliable.
+server's, which is what makes the web research reliable.
 
-In Claude Desktop: **Projects → New Project**, then fill in:
+**This server is built to be used with heavy web research.** Rankings, projections and expert
+consensus are one input, and they lag real life. The setup below tells Claude to search the web for
+every player it recommends instead of leaning on any single ranking source.
+
+In Claude (web, desktop or phone): **Projects → New Project**, then fill in:
 
 **What are you trying to achieve?** (the description)
 
-> Win my Sleeper fantasy football leagues with roster-aware advice on waivers, start/sit, and
-> drops. Recommendations should fit my actual roster and league, not just rankings, and be backed
+> Win my Sleeper fantasy football leagues with roster-aware advice on waivers, start/sit, trades
+> and drops. Recommendations should fit my actual roster and league, not just rankings, and be backed
 > by current news and expert opinion.
 
-**Instructions:**
+**Instructions** (replace the placeholders):
 
 > My Sleeper username is `YOUR_USERNAME`; my main team is in `YOUR_LEAGUE_NAME`.
 >
-> Use the **fantasy** MCP server (get_team_context, get_free_agents, get_player_report,
-> get_trending_players, etc.) plus web search. Do not use other fantasy connectors in this
-> project.
+> Before any fantasy recommendation, web search the latest news (last 48 hours) for every player you
+> recommend or compare, and run every search listed in `research_needed`. Cite sources and dates.
+> If you can't find why something happened, say so; don't guess.
 >
-> Before any fantasy recommendation, web search the latest news (last 48 hours) for every player
-> you recommend or compare, and run every search listed in `research_needed`. Cite sources and
-> dates. If you can't find why something happened, say so; don't guess.
+> Do not use the FantasyPros connector for this. Strictly use the **fantasy** MCP server (the hosted
+> one, not `fantasy-local`). Use only those tools plus web search.
+
+Why each line is there:
+- **The research rule** makes web search a required step, not an optional extra, and "cite sources and
+  dates" keeps the answers checkable.
+- **"Do not use the FantasyPros connector"**: some connectors ship instructions telling Claude to
+  treat their rankings as final and *not* web search, which works directly against the research loop.
+- **"The hosted one, not `fantasy-local`"** avoids Claude picking the wrong server if you have both
+  enabled. You can leave this out if you only run one.
 
 Then, in each chat:
 - ✅ Make sure **web search is turned on** in the tools menu. The research loop depends on it.
-- ✅ Make sure the **fantasy** server is enabled.
-- ⚠️ **Turn off other fantasy connectors** (e.g. FantasyPros) in this Project's chats. Some ship
-  instructions telling Claude to treat their rankings as final and *not* web search, which works
-  directly against the research loop. You can keep using them in other chats.
+- ✅ Make sure the **fantasy** connector is enabled (and `fantasy-local` and any other fantasy
+  connectors are off).
+
+---
+
+## ☁️ Deploying to Cloud Run
+
+Run it as a **private remote server** so it works from claude.ai on the web and your phone, for about
+**$0/month** (inside Cloud Run's always-free tier). Only the Google accounts you allow can use it.
+
+**Pieces**
+- **Cloud Run**, scaled to zero. The first request after idle takes a few seconds (a cold start).
+- **Cloud Storage** holds the cache, so it survives cold starts. Hot reads come from memory.
+- **Its own OAuth 2.1 layer** (`src/auth/`): Google sign-in for identity, an email allowlist, and
+  stateless signed JWTs (no token database). This is what claude.ai's custom connector speaks.
+- **Secret Manager** for `JWT_SECRET` and the Google client secret.
+- **GitHub Actions** deploys on every push to `main`.
+
+### Who can use it
+
+Three gates, so knowing the URL isn't enough:
+1. The Google OAuth consent screen is in **Testing** mode: only accounts you add as test users can
+   even attempt to sign in.
+2. After sign-in, the verified email must be in **`ALLOWED_EMAILS`**, or no token is issued.
+3. Every call to `/mcp` needs a valid Bearer token for an allowlisted user.
+
+The allowlist is re-checked on every request and every token refresh, so removing an email cuts that
+person off immediately. Rotating `JWT_SECRET` signs everyone out. Only `/` (a health text) and the
+OAuth routes are public.
+
+### Environment variables
+
+| Variable | Required | Notes |
+|---|---|---|
+| `CACHE_BUCKET` | yes (on Cloud Run) | Cloud Storage bucket for the cache |
+| `PUBLIC_URL` | yes | Public base URL of the service, no trailing slash |
+| `GOOGLE_CLIENT_ID` | yes | From your Google OAuth client |
+| `GOOGLE_CLIENT_SECRET` | yes | Keep in Secret Manager |
+| `JWT_SECRET` | yes | 32+ characters, e.g. `openssl rand -base64 48`. Keep in Secret Manager |
+| `ALLOWED_EMAILS` | yes | Comma-separated, compared lowercase |
+| `AUTH_DISABLED` | local only | `1` skips auth for local testing. **Refused on Cloud Run.** |
+| `PORT` | no | Defaults to 8080 |
+
+The server exits at startup if a required variable is missing.
+
+### One-time setup
+
+You need the [gcloud CLI](https://cloud.google.com/sdk/docs/install) and a Google Cloud billing account.
+
+1. **Create a dedicated project** (nothing else in it) and link billing. A free-trial billing account
+   is the safest: Google never charges the card, and resources just stop when the credit runs out.
+   Don't click "Activate full account" until you've decided to keep running after the trial.
+2. **Set up the cost protection below** before deploying anything.
+3. **Enable APIs**: `run`, `cloudbuild`, `artifactregistry`, `storage`, `secretmanager`.
+4. **Create a bucket** in `us-central1`, and a dedicated runtime service account with
+   `roles/storage.objectAdmin` on that bucket only.
+5. **Create a Google OAuth client** (Console → Google Auth Platform): audience **External**, status
+   **Testing**, your emails as **test users**; client type **Web application** with the redirect URI
+   `<SERVICE_URL>/oauth/google/callback` (add `http://localhost:8080/oauth/google/callback` to test
+   locally).
+6. **Store the two secrets** in Secret Manager and let the runtime service account read them.
+7. **Deploy** (set the real values; `PUBLIC_URL` is `https://<service>-<project-number>.<region>.run.app`):
+   ```sh
+   gcloud run deploy fantasy-mcp --source . --region us-central1 --service-account <RUNTIME_SA> \
+     --allow-unauthenticated --min-instances 0 --max-instances 1 --concurrency 20 --timeout 60 \
+     --memory 512Mi --cpu 1 --cpu-throttling \
+     --set-env-vars CACHE_BUCKET=...,PUBLIC_URL=...,GOOGLE_CLIENT_ID=...,ALLOWED_EMAILS=... \
+     --set-secrets JWT_SECRET=jwt-secret:latest,GOOGLE_CLIENT_SECRET=google-client-secret:latest
+   ```
+   `--allow-unauthenticated` is intentional: Google's IAM gate would block claude.ai, so the OAuth
+   layer is the gate. After this first deploy, `npm run deploy` repeats it (env vars and secrets
+   persist on the service).
+8. **Connect Claude**: claude.ai → Settings → Connectors → **Add custom connector** → URL
+   `<SERVICE_URL>/mcp` → Connect → sign in with Google. On the "Google hasn't verified this app"
+   screen (normal in Testing mode for your own app), choose Advanced → continue. Connectors added on
+   the web sync to the mobile app.
+
+### 💸 Cost protection
+
+Google budgets only *alert*; they don't stop spending. So this uses layers:
+
+1. **Dedicated project**, so a kill switch can't take anything else down.
+2. **Free-trial billing account** (see above).
+3. **Hard caps on the service**: max 1 instance, concurrency 20, 60 s timeout, 512Mi, 1 CPU,
+   min 0, CPU only billed during requests.
+4. **Budget alerts**: a $5 budget scoped to the project, with alerts at 20%, 50%, 90%, 100% and a
+   100% forecast.
+5. **Automatic kill switch**: the budget publishes to a Pub/Sub topic that triggers
+   [`infra/billing-guard`](infra/billing-guard/), a tiny private Cloud Run service that **disables
+   billing on the project** when actual cost reaches the budget. If it fires, the server goes offline
+   until you re-link billing. It has a `DRY_RUN=1` mode that only logs.
+6. **Cleanup policies**: Artifact Registry keeps the 2 newest images and source-upload buckets expire
+   objects after 7 days.
+
+### 🔄 CI/CD
+
+`.github/workflows/deploy.yml` runs on **pushes to `main` only** (never on pull requests: this repo is
+public, and forks must not reach your cloud). It type-checks and runs the tests, deploys, then
+smoke-tests (`GET /` returns 200 and an unauthenticated `POST /mcp` returns 401).
+
+- **No keys**: it authenticates with **Workload Identity Federation**, and the provider only accepts
+  tokens from this repo's `main` branch.
+- **Least privilege**: a dedicated deployer service account with narrowly scoped roles.
+- **Config stays on the service**: secrets and env vars are never in the workflow. The repo holds only
+  three non-secret variables: `GCP_PROJECT_ID`, `GCP_WIF_PROVIDER` and `GCP_DEPLOYER_SA`.
+- Docs-only pushes (`*.md`, `docs/`) don't trigger a deploy.
 
 ---
 
@@ -260,8 +377,12 @@ src/
       news.ts           ESPN player news
       fantasycalc.ts    trade market values
       ids.ts            cross-site player ID matching
-  storage/              cache backends (local files now; Cloudflare KV later)
-  adapters/             entry points: stdio (Claude Desktop/Code), HTTP (node)
+  storage/              cache backends: memory, local files (dev), Cloud Storage (hosted)
+  auth/                 OAuth 2.1 server for the hosted version: Google sign-in, allowlist, JWTs
+  adapters/             entry points: stdio (Claude Desktop/Code), HTTP (local), Cloud Run
+test/                   auth flow tests (`npm test`)
+infra/billing-guard/    kill switch that disables billing when the budget is hit
+.github/workflows/      deploy on push to main
 ```
 
 **Design choices:**
@@ -274,8 +395,8 @@ src/
   and how old it is, so Claude can tell when something is stale.
 - 🔗 **Players are matched across sources** using the DynastyProcess ID crosswalk, with a
   name + team fallback for players it doesn't cover yet (mostly rookies and kickers).
-- 🌍 **Portable.** Built on web-standard APIs and [Hono](https://hono.dev), so the same code can
-  be deployed to Cloudflare Workers (or elsewhere) later.
+- 🌍 **Portable.** Built on web-standard APIs and [Hono](https://hono.dev). Each host is a small
+  adapter plus a storage backend, so the core isn't tied to Cloud Run.
 
 ### 📡 Data sources and refresh rates
 
@@ -289,14 +410,17 @@ src/
 | [FantasyCalc](https://fantasycalc.com) | Redraft trade values from real trades (matched to your league's size, QBs and PPR) | 6 h |
 | [ffopportunity](https://github.com/ffverse/ffopportunity) / [nflverse](https://github.com/nflverse) | Expected vs. actual fantasy points, target/air-yard/rush share | 6 h (nightly upstream) |
 
-Cached responses live in `.cache/`. Delete it to force a full refresh.
+Locally, cached responses live in `.cache/` (delete it to force a full refresh). On Cloud Run they live
+in the Cloud Storage bucket.
 
 ---
 
 ## ⚠️ Limitations
 
-- **Runs on your computer.** For now it only works in Claude Desktop or Claude Code on the machine
-  running it. Phone support needs a hosted deployment (planned).
+- **Hosted cold starts.** On Cloud Run the first request after idle takes a few seconds while the
+  instance starts and the cache reloads. It runs one small instance by design to cap cost.
+- **Private by design.** The hosted version is for you and the people you allow, not a public service.
+  Anyone you add shares one cache and one cost cap.
 - **Sleeper only**, and NFL redraft is the main focus. Dynasty and keeper leagues work, but the
   advice isn't tuned for them yet.
 - **FantasyPros ranks are PPR** for skill positions. Half-PPR and standard leagues get a note
@@ -309,7 +433,6 @@ Cached responses live in `.cache/`. Delete it to force a full refresh.
 
 ## 🗺️ Roadmap
 
-- ☁️ Deploy to Cloudflare Workers with Google login, so it works on your phone and stays private
 - 🎰 Vegas implied team totals for weekly start/sit
 
 ---
